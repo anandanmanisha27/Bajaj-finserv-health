@@ -13,7 +13,7 @@ This project provides a **Bill Data Extraction API** that extracts line item det
 
 ---
 
-## Installation (Local)
+## Installation (Local) or can use the already deployed link: [Demo](https://bajaj-finserv-t1ze.onrender.com/docs)
 
 1. **Clone the repository**
 
