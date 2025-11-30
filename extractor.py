@@ -1,76 +1,63 @@
-import os, base64, json
-from typing import List, Literal
-from pydantic import BaseModel, Field
-import google.generativeai as genai
-from dotenv import load_dotenv
+import json
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from utils import download_file, process_document
+from extractor import analyze_page
 
-load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+app = FastAPI()
 
-# ---------------- Schema ----------------
-class BillItem(BaseModel):
-    item_name: str
-    item_amount: float
-    item_rate: float
-    item_quantity: float
+@app.get("/")
+def home():
+    return {"status": "FastAPI running successfully!", "message": "Webhook Ready 🚀"}
 
-    class Config:
-        extra = "ignore"  # <== This fixes schema crash
+class ExtractionRequest(BaseModel):
+    document: str  # URL
 
-
-class PageData(BaseModel):
-    page_no: str
-    page_type: Literal["Bill Detail", "Final Bill", "Pharmacy"]
-    bill_items: List[BillItem]
-
-    class Config:
-        extra = "ignore"  # <== extremely important
-
-# ------------ Convert Image Path → base64 before sending ------------
-def encode_image(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
-
-
-# ------------ Main Extraction Function ------------
-def analyze_page(image_path: str, page_number: int):
-    """
-    Sends an image file path to Gemini, returns structured JSON result.
-    """
-    encoded_img = encode_image(image_path)
-
-    prompt = f"""
-    Extract detailed bill items from hospital bill image - Page {page_number}.
-    Output must strictly follow the JSON schema.
-
-    Rules:
-    - Extract ONLY item rows (not totals/subtotals/discount/summary).
-    - Convert numbers to float.
-    - If qty missing → default to 1.0
-    - "Final Bill" page should return empty bill_items unless new items exist.
-    """
-
-    model = genai.GenerativeModel("gemini-2.5-flash")
+@app.post("/extract-bill-data")
+async def extract_bill_data(request: ExtractionRequest):
+    
+    total_tokens_used = {"input": 0, "output": 0}
+    all_pages_data = []
+    total_items_count = 0
 
     try:
-        result = model.generate_content(
-            [
-                {"mime_type": "image/png", "data": encoded_img},
-                prompt
-            ],
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=PageData
-            )
-        )
+        # 1) Download
+        file_path = download_file(request.document)
+        print("Downloaded:", file_path)
 
-        usage = result.usage_metadata
-        return result.text, usage.prompt_token_count, usage.candidates_token_count
+        # 2) Convert → returns list of image file paths
+        pages = process_document(file_path)
+
+        # 3) Process Page-wise
+        for idx, img_path in enumerate(pages, start=1):
+            print(f"Extracting Page {idx}")
+            json_text, in_tok, out_tok = analyze_page(img_path, idx)
+
+            page = json.loads(json_text)
+            page["page_no"] = str(idx)
+
+            total_tokens_used["input"] += in_tok
+            total_tokens_used["output"] += out_tok
+            total_items_count += len(page.get("bill_items", []))
+
+            all_pages_data.append(page)
+
+        return {
+            "is_success": True,
+            "token_usage": {
+                "input_tokens": total_tokens_used["input"],
+                "output_tokens": total_tokens_used["output"],
+                "total_tokens": sum(total_tokens_used.values())
+            },
+            "data": {
+                "pagewise_line_items": all_pages_data,
+                "total_item_count": total_items_count
+            }
+        }
 
     except Exception as e:
-        print("\n 🔻 Extraction failed on page", page_number, ":", e)
-        return json.dumps({
-            "page_no": str(page_number),
-            "page_type": "Bill Detail",
-            "bill_items": []
-        }), 0, 0
+        return {"is_success": False, "error": str(e), "data": None}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
